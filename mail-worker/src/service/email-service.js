@@ -9,7 +9,8 @@ import accountService from './account-service';
 import BizError from '../error/biz-error';
 import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
-import { Resend } from 'resend';
+// 移除原本的 resend 依賴
+// import { Resend } from 'resend';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -471,7 +472,7 @@ const emailService = {
 			}
 		};
 
-		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend。
+		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend(現改為 Brevo)。
 		let deliveries;
 		if (allInternal) {
 			deliveries = this.sendInternal(c, context);
@@ -545,15 +546,12 @@ const emailService = {
 		}
 	},
 
-	// Resend 分开发送一次最多提交 100 封独立邮件，普通发送仍调用单封接口。
+	// 改為 Brevo 發送。如果分開發送就一封一封送，一般發送則走單一API呼叫
 	async *sendResend(c, { separate, resendToken, sendParams, saveParams }) {
 		if (separate && sendParams.receiveEmail.length > 100) {
 			throw new BizError(t('resendRecipientLimit'));
 		}
-		// 批量接口不支持附件，包含正文转换得到的内嵌附件。
-		if (separate && sendParams.attachments.length > 0) {
-			throw new BizError(t('resendSeparateAttachments'));
-		}
+
 		let result;
 		try {
 			result = separate
@@ -568,12 +566,13 @@ const emailService = {
 			yield { error: result.error };
 			return;
 		}
-		// 严格校验模式下，批量返回的邮件 ID 按提交顺序对应各收件人。
+		
 		const items = separate
 			? sendParams.receiveEmail.map((address, index) => ({
 				receiveEmail: [address], id: result.data.data[index].id
 			}))
 			: [{ receiveEmail: sendParams.receiveEmail, id: result.data?.id }];
+		
 		const emails = [];
 		for (const item of items) {
 			emails.push(await this.saveSentEmail(c, {
@@ -636,24 +635,24 @@ const emailService = {
 		return emailResult;
 	},
 
-	// 附件已在 Resend 处理器中校验，批量接口为每位收件人构造独立邮件。
-	async sendBatchByResend(resendToken, params) {
-		const resend = new Resend(resendToken);
-		const sendForm = {
-			from: `${params.name} <${params.accountEmail}>`,
-			subject: params.subject,
-			text: params.text,
-			html: params.html
-		};
-		if (params.sendType === 'reply' && params.messageId) {
-			sendForm.headers = {
-				'in-reply-to': params.messageId,
-				'references': params.messageId
-			};
+	// 使用 Brevo 批量發送（每位收件人獨立呼叫 Brevo API）
+	async sendBatchByResend(brevoApiKey, params) {
+		const results = [];
+		for (const address of params.receiveEmail) {
+			const res = await this.sendByResend(brevoApiKey, {
+				...params,
+				receiveEmail: [address]
+			});
+			if (res.error) {
+				return res;
+			}
+			results.push(res.data);
 		}
-		return resend.batch.send(params.receiveEmail.map(address => ({
-			...sendForm, to: [address]
-		})), { batchValidation: 'strict' });
+		return {
+			data: {
+				data: results
+			}
+		};
 	},
 
 	async sendByCloudflareEmail(c, params) {
@@ -692,26 +691,74 @@ const emailService = {
 		};
 	},
 
-	async sendByResend(resendToken, params) {
-		const resend = new Resend(resendToken);
-
-		const sendForm = {
-			from: `${params.name} <${params.accountEmail}>`,
-			to: [...params.receiveEmail],
-			subject: params.subject,
-			text: params.text,
-			html: params.html,
-			attachments: await this.toResendAttachments(params.attachments)
+	// 使用 Brevo REST API 發送郵件
+	async sendByResend(brevoApiKey, params) {
+		const headers = {
+			'accept': 'application/json',
+			'api-key': brevoApiKey,
+			'content-type': 'application/json'
 		};
 
-		if (params.sendType === 'reply') {
-			sendForm.headers = {
-				'in-reply-to': params.messageId,
-				'references': params.messageId
+		const body = {
+			sender: {
+				name: params.name,
+				email: params.accountEmail
+			},
+			to: params.receiveEmail.map(address => ({ email: address })),
+			subject: params.subject,
+			htmlContent: params.html || (params.text ? `<pre>${params.text}</pre>` : '')
+		};
+
+		if (params.text) {
+			body.textContent = params.text;
+		}
+
+		// 處理回覆郵件 Header
+		if (params.sendType === 'reply' && params.messageId) {
+			body.headers = {
+				'In-Reply-To': params.messageId,
+				'References': params.messageId
 			};
 		}
 
-		return await resend.emails.send(sendForm);
+		// 處理附件格式 (Brevo 支援 base64 content 與 name)
+		const attachments = await this.toResendAttachments(params.attachments);
+		if (attachments && attachments.length > 0) {
+			body.attachment = attachments.map(att => ({
+				name: att.filename || 'attachment',
+				content: att.content 
+			}));
+		}
+
+		try {
+			const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+				method: 'POST',
+				headers,
+				body: JSON.stringify(body)
+			});
+
+			const resJson = await response.json();
+
+			if (!response.ok) {
+				return {
+					error: {
+						message: resJson.message || JSON.stringify(resJson)
+					}
+				};
+			}
+
+			return {
+				data: {
+					id: resJson.messageId
+				}
+			};
+		} catch (err) {
+			return {
+				error: {
+					message: err.message
+				}
+			};
+		}
 	},
 
 	async toCloudflareAttachments(attachments) {
